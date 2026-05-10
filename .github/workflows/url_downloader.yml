@@ -1,146 +1,152 @@
-name: دانلودر لینک مستقیم
+name: "دانلودر لینک مستقیم"
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'لینک مستقیم فایل مورد نظر'
+        description: "Direct File URL"
         required: true
         type: string
+
       zip_password:
-        description: 'رمز عبور برای فایل فشرده (اختیاری؛ خالی = بدون رمز)'
+        description: "Password for archive (leave empty for no password)"
         required: false
+        default: ""
         type: string
-        default: ''
-      output_folder:
-        description: 'پوشه ذخیره فایل و آرشیوها (نسبت به ریشه مخزن)'
+
+      max_part_mb:
+        description: "Maximum size per part (MB)"
         required: false
+        default: "90"
         type: string
-        default: 'downloads'
+
+      upload_method:
+        description: "Upload Method"
+        required: true
+        default: "repository"
+        type: choice
+        options:
+          - repository
+          - release
+
+      release_tag:
+        description: "Release Tag"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  leech-split-file:
+  direct-download:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create output folder
-        run: mkdir -p "${{ inputs.output_folder }}"
-
-      - name: Install 7z
+      - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl
 
-      - name: Download file
-        id: download_file
+      - name: Download File
+        id: download
+        shell: bash
         run: |
-          curl -L --fail --retry 3 -o "${{ inputs.output_folder }}/downloaded_file" "${{ github.event.inputs.file_url }}"
-          echo "File downloaded. Size: $(ls -lh "${{ inputs.output_folder }}/downloaded_file" | awk '{print $5}')"
-          echo "downloaded_file_path=${{ inputs.output_folder }}/downloaded_file" >> $GITHUB_OUTPUT
+          mkdir -p temp_dl
 
-      - name: Extract original filename and prepare for archive
-        id: get_filename
+          FILE_URL="${{ github.event.inputs.file_url }}"
+
+          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+
+          echo "Downloading: $FILENAME"
+
+          curl -L --fail --retry 3 \
+            -o "temp_dl/$FILENAME" \
+            "$FILE_URL"
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
         run: |
-          DOWNLOADED_FILE="${{ steps.download_file.outputs.downloaded_file_path }}"
-          ORIGINAL_URL="${{ github.event.inputs.file_url }}"
-          
-          FILENAME_FROM_URL=$(basename "$ORIGINAL_URL")
-          if [[ -z "$FILENAME_FROM_URL" || "$FILENAME_FROM_URL" == "/" ]]; then
-            FILENAME_FROM_URL="downloaded_file"
-          fi
-          
-          FILENAME_BASE=$(echo "$FILENAME_FROM_URL" | sed 's/\.[^.]*$//' | cut -d '?' -f 1)
-          FILENAME_EXT="${FILENAME_FROM_URL##*.}"
-          
-          if [[ "$FILENAME_BASE" == "$FILENAME_FROM_URL" ]]; then
-            FILENAME_EXT=""
-          fi
-          
-          ARCHIVE_PREFIX=""
-          FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${FILENAME_BASE}"
-          
-          MAX_TOTAL_LEN=50
-          CURRENT_LEN=${#FULL_ARCHIVE_NAME}
-          if [[ $CURRENT_LEN -gt $MAX_TOTAL_LEN ]]; then
-            BASE_LEN_TO_KEEP=$((MAX_TOTAL_LEN - ${#ARCHIVE_PREFIX} - ${#FILENAME_EXT} - 1))
-            if [[ $BASE_LEN_TO_KEEP -lt 1 ]]; then BASE_LEN_TO_KEEP=1; fi
-            SHORT_FILENAME_BASE=$(echo "$FILENAME_BASE" | cut -c 1-$BASE_LEN_TO_KEEP)
-            FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${SHORT_FILENAME_BASE}"
-          fi
-          
-          if [[ -n "$FILENAME_EXT" ]]; then
-            FINAL_ARCHIVE_FILENAME="${FULL_ARCHIVE_NAME}.${FILENAME_EXT}"
-          else
-            FINAL_ARCHIVE_FILENAME="${FULL_ARCHIVE_NAME}"
-          fi
-          
-          echo "Original file name: ${FILENAME_FROM_URL}"
-          echo "Archive base name will be: ${FINAL_ARCHIVE_FILENAME}"
-          
-          echo "archive_base_name=${FULL_ARCHIVE_NAME}" >> $GITHUB_OUTPUT
-          echo "downloaded_file_path=${DOWNLOADED_FILE}" >> $GITHUB_OUTPUT
-          echo "file_extension=${FILENAME_EXT}" >> $GITHUB_OUTPUT
-          echo "final_archive_name=${FINAL_ARCHIVE_FILENAME}" >> $GITHUB_OUTPUT
-
-      - name: Rename downloaded file
-        id: rename_file
-        run: |
-          ARCHIVE_NAME_PREFIX="${{ steps.get_filename.outputs.archive_base_name }}"
-          DOWNLOADED_FILE="${{ steps.get_filename.outputs.downloaded_file_path }}"
-          EXT="${{ steps.get_filename.outputs.file_extension }}"
-          NEW_ORIGINAL_FILENAME="$ARCHIVE_NAME_PREFIX"
-          if [[ -n "$EXT" ]]; then
-            NEW_ORIGINAL_FILENAME="${ARCHIVE_NAME_PREFIX}.${EXT}"
-          fi
-          NEW_ORIGINAL_PATH="${{ inputs.output_folder }}/${NEW_ORIGINAL_FILENAME}"
-          mv "$DOWNLOADED_FILE" "$NEW_ORIGINAL_PATH"
-          echo "Renamed downloaded file to: $NEW_ORIGINAL_PATH"
-          echo "new_original_filename=${NEW_ORIGINAL_FILENAME}" >> $GITHUB_OUTPUT
-          echo "new_original_path=${NEW_ORIGINAL_PATH}" >> $GITHUB_OUTPUT
-
-      - name: Generate timestamp for unique archive
-        id: timestamp
-        run: echo "value=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
-
-      - name: Create split archive (with optional password)
-        run: |
-          ARCHIVE_NAME_PREFIX="${{ steps.get_filename.outputs.archive_base_name }}_${{ steps.timestamp.outputs.value }}"
-          NEW_ORIGINAL_PATH="${{ steps.rename_file.outputs.new_original_path }}"
+          FILEPATH="${{ steps.download.outputs.filepath }}"
           PASS="${{ github.event.inputs.zip_password }}"
-          cd "${{ inputs.output_folder }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
 
-          FILE="$(basename "$NEW_ORIGINAL_PATH")"
+          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          BASENAME=$(basename "$FILEPATH")
+
+          cd temp_dl || exit 1
+
+          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+
           if [ -n "$PASS" ]; then
-            7z a -p"$PASS" -mhe=on -mx=3 -v85m "${ARCHIVE_NAME_PREFIX}.7z" "$FILE"
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
           else
-            7z a -mx=3 -v85m "${ARCHIVE_NAME_PREFIX}.7z" "$FILE"
+            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
           fi
 
-          # If only one part generated, rename it to .7z
-          if [ -f "${ARCHIVE_NAME_PREFIX}.7z.001" ] && [ ! -f "${ARCHIVE_NAME_PREFIX}.7z.002" ]; then
-            mv "${ARCHIVE_NAME_PREFIX}.7z.001" "${ARCHIVE_NAME_PREFIX}.7z"
-            echo "Single chunk - renamed to .7z"
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
           fi
 
-      - name: Remove original downloaded file
+          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+
+          cd ..
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
         run: |
-          FILE="${{ steps.rename_file.outputs.new_original_path }}"
-          if [[ -n "$FILE" && -f "$FILE" ]]; then
-            rm "$FILE"
-          fi
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and push
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}/"
-          git commit -m "Add file from ${{ github.event.inputs.file_url }} [skip ci]" || echo "No changes to commit"
+
+          mkdir -p downloads
+
+          mv temp_dl/* downloads/ 2>/dev/null || true
+
+          git add downloads/
+
+          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+
           git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
+          name: Direct Download Release
+          body: |
+            Direct download completed.
+
+            File: ${{ steps.download.outputs.filename }}
+            Date: ${{ steps.get_date.outputs.date }}
+          files: temp_dl/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl

@@ -1,4 +1,5 @@
-[{
+[
+    {
     "dns": {
       "queryStrategy": "UseIPv4",
       "hosts": {

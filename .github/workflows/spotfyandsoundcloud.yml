@@ -1,0 +1,225 @@
+name: "Spotify & SoundCloud Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: "Spotify or SoundCloud URL"
+        required: true
+        type: string
+
+      output_format:
+        description: "Output Format"
+        required: true
+        type: choice
+        options:
+          - mp3
+          - flac
+        default: mp3
+
+      audio_quality:
+        description: "Audio Quality"
+        required: true
+        type: choice
+        options:
+          - 128k
+          - 192k
+          - 320k
+        default: 320k
+
+      max_part_mb:
+        description: "Max Part Size (MB)"
+        required: false
+        type: string
+        default: "90"
+
+      upload_method:
+        description: "Upload Method"
+        required: true
+        type: choice
+        options:
+          - repository
+          - release
+        default: repository
+
+      release_tag:
+        description: "Release Tag"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  media-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+
+          sudo apt-get install -y \
+            ffmpeg \
+            curl \
+            jq \
+            zip \
+            python3 \
+            python3-pip
+
+          pip3 install --quiet yt-dlp
+
+      - name: Create Download Folder
+        shell: bash
+        run: |
+          mkdir -p release_files
+
+      - name: Start Downtify Container
+        if: contains(github.event.inputs.media_url, 'spotify.com')
+        shell: bash
+        run: |
+          docker run -d \
+            --name downtify \
+            -p 8000:8000 \
+            ghcr.io/henriquesebastiao/downtify:latest
+
+          echo "Waiting for Downtify startup..."
+          sleep 40
+
+      - name: Debug Downtify Routes
+        if: contains(github.event.inputs.media_url, 'spotify.com')
+        shell: bash
+        run: |
+          echo "Checking available routes..."
+
+          curl -s http://localhost:8000/openapi.json || true
+
+      - name: Download Spotify Media
+        if: contains(github.event.inputs.media_url, 'spotify.com')
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.media_url }}"
+
+          echo "Spotify detected"
+
+          curl -L \
+            "http://localhost:8000/download?url=$URL" \
+            --output "release_files/spotify_download.mp3"
+
+      - name: Download SoundCloud Media
+        if: contains(github.event.inputs.media_url, 'soundcloud.com')
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.media_url }}"
+          FORMAT="${{ github.event.inputs.output_format }}"
+          QUALITY="${{ github.event.inputs.audio_quality }}"
+
+          echo "SoundCloud detected"
+
+          yt-dlp \
+            -x \
+            --audio-format "$FORMAT" \
+            --audio-quality "$QUALITY" \
+            -o "release_files/%(title)s.%(ext)s" \
+            "$URL"
+
+      - name: Validate Download
+        shell: bash
+        run: |
+          FILE_COUNT=$(find release_files -type f | wc -l)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::No files downloaded"
+            exit 1
+          fi
+
+          echo "Downloaded files:"
+          ls -lh release_files/
+
+      - name: Split Large Files
+        shell: bash
+        run: |
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if [[ "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          cd release_files || exit 1
+
+          for FILE in *; do
+            [ -f "$FILE" ] || continue
+
+            FILESIZE=$(stat -c%s "$FILE")
+            THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+
+            if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+              echo "Splitting: $FILE"
+
+              BASE="${FILE%.*}"
+
+              zip -r -s "${THRESH_MB}m" "${BASE}.zip" -- "$FILE"
+
+              rm -f "$FILE"
+            fi
+          done
+
+          cd ..
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p downloads
+
+          mv release_files/* downloads/ || true
+
+          git add downloads/
+
+          git commit -m "Media Download [skip ci]" || echo "Nothing to commit"
+
+          git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('media-{0}', github.run_number) }}
+          name: "Spotify & SoundCloud Download"
+          body: |
+            Media Download Complete
+
+            URL: ${{ github.event.inputs.media_url }}
+            Format: ${{ github.event.inputs.output_format }}
+            Quality: ${{ github.event.inputs.audio_quality }}
+            Downloaded on: ${{ steps.get_date.outputs.date }}
+
+            Powered by Meli-Action ⚡
+          files: release_files/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f downtify 2>/dev/null || true
+          rm -rf release_files
